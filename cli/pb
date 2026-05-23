@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""PasteBin CLI — create, get, list, delete, fork, and import pastes from the terminal."""
+
+import argparse
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+
+CONFIG_FILE = os.path.expanduser("~/.pbrc")
+
+# ── Colors ────────────────────────────────────────────────────────────────
+
+class C:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+
+def c(text, color):
+    if not sys.stdout.isatty():
+        return str(text)
+    return f"{color}{text}{C.RESET}"
+
+
+# ── Config ────────────────────────────────────────────────────────────────
+
+def load_config():
+    server = "http://localhost:8002"
+    api_key = os.environ.get("PB_API_KEY", "")
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("server="):
+                    server = line[7:]
+                elif line.startswith("api_key="):
+                    api_key = line[8:]
+    return server, api_key
+
+
+def save_config(server, api_key):
+    with open(CONFIG_FILE, "w") as f:
+        f.write(f"server={server}\n")
+        f.write(f"api_key={api_key}\n")
+
+
+# ── API Client ────────────────────────────────────────────────────────────
+
+class Client:
+    def __init__(self, server, api_key):
+        self.server = server.rstrip("/")
+        self.api_key = api_key
+
+    def _request(self, method, path, data=None, raw=False):
+        url = f"{self.server}{path}"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+
+        body = json.dumps(data).encode() if data else None
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+
+        try:
+            resp = urllib.request.urlopen(req, timeout=30)
+            if raw:
+                return resp.read().decode("utf-8", errors="replace")
+            return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            try:
+                detail = json.loads(body).get("detail", body)
+            except Exception:
+                detail = body
+            print(c(f"Error: {e.code} — {detail}", C.RED), file=sys.stderr)
+            sys.exit(1)
+
+    def get(self, path):
+        return self._request("GET", path)
+
+    def get_raw(self, path):
+        return self._request("GET", path, raw=True)
+
+    def post(self, path, data):
+        return self._request("POST", path, data)
+
+    def put(self, path, data):
+        return self._request("PUT", path, data)
+
+    def delete(self, path):
+        return self._request("DELETE", path)
+
+
+# ── Commands ──────────────────────────────────────────────────────────────
+
+def cmd_create(client, args):
+    """Create a paste from file or stdin."""
+    if args.file == "-":
+        content = sys.stdin.read()
+    elif args.file:
+        if not os.path.exists(args.file):
+            print(c(f"File not found: {args.file}", C.RED), file=sys.stderr)
+            sys.exit(1)
+        with open(args.file) as f:
+            content = f.read()
+        if not args.language:
+            ext = os.path.splitext(args.file)[1]
+            ext_map = {".py": "python", ".js": "javascript", ".ts": "typescript", ".rs": "rust",
+                       ".go": "go", ".java": "java", ".c": "c", ".cpp": "cpp", ".html": "html",
+                       ".css": "css", ".json": "json", ".yaml": "yaml", ".yml": "yaml",
+                       ".sh": "bash", ".sql": "sql", ".md": "markdown"}
+            args.language = ext_map.get(ext, "text")
+    else:
+        print(c("Provide a file path or use '-' for stdin", C.RED), file=sys.stderr)
+        sys.exit(1)
+
+    if not content.strip():
+        print(c("Content is empty", C.RED), file=sys.stderr)
+        sys.exit(1)
+
+    data = {
+        "content": content,
+        "language": args.language or "text",
+        "title": args.title or None,
+        "burn_after_read": args.burn,
+        "expiry": args.expiry or "never",
+    }
+    if args.password:
+        data["password"] = args.password
+
+    result = client.post("/api/pastes", data)
+    print(c("Paste created!", C.GREEN))
+    print(f"  URL:        {c(client.server + '/' + result['id'], C.CYAN)}")
+    print(f"  ID:         {result['id']}")
+    if result.get("edit_token"):
+        print(f"  Edit token: {c(result['edit_token'], C.YELLOW)} (save this to edit later)")
+
+
+def cmd_get(client, args):
+    """Get and print paste content."""
+    result = client.get(f"/api/pastes/{args.id}")
+    if result.get("is_encrypted"):
+        if args.password:
+            result = client.post(f"/api/pastes/{args.id}/verify", {"password": args.password})
+        else:
+            print(c("[Encrypted — pass --password to decrypt]", C.YELLOW))
+            return
+
+    if args.raw or args.quiet:
+        print(result["content"], end="")
+    else:
+        title = result.get("title") or result["id"]
+        lang = result.get("language", "text")
+        views = result.get("view_count", 0)
+        created = result.get("created_at", "")[:19]
+        print(c(f"# {title}", C.BOLD))
+        print(c(f"# Language: {lang} | Views: {views} | Created: {created}", C.DIM))
+        print()
+        print(result["content"], end="")
+
+
+def cmd_list(client, args):
+    """List recent pastes."""
+    result = client.get(f"/api/pastes?page=1&per_page={args.limit or 20}")
+    pastes = result.get("pastes", [])
+    total = result.get("total", 0)
+
+    if not pastes:
+        print(c("No pastes found.", C.DIM))
+        return
+
+    print(c(f"Recent pastes ({total} total):", C.BOLD))
+    print()
+    # Table header
+    print(f"  {'ID':<8} {'Language':<12} {'Views':>6}  {'Title'}")
+    print(f"  {'─'*8} {'─'*12} {'─'*6}  {'─'*30}")
+
+    for p in pastes:
+        pid = c(p["id"], C.CYAN)
+        lang = p["language"]
+        views = p["view_count"]
+        title = p.get("title") or c("(untitled)", C.DIM)
+        extra = ""
+        if p.get("burn_after_read"):
+            extra += " [burn]"
+        if p.get("is_encrypted"):
+            extra += " [encrypted]"
+        if p.get("fork_count", 0) > 0:
+            extra += f" [{p['fork_count']} forks]"
+
+        print(f"  {pid:<17} {lang:<12} {views:>6}  {title}{c(extra, C.DIM)}")
+
+
+def cmd_delete(client, args):
+    """Delete a paste."""
+    client.delete(f"/api/pastes/{args.id}")
+    print(c(f"Paste {args.id} deleted.", C.GREEN))
+
+
+def cmd_fork(client, args):
+    """Fork a paste."""
+    result = client.post(f"/api/pastes/{args.id}/fork", {})
+    print(c("Paste forked!", C.GREEN))
+    print(f"  New URL: {c(client.server + '/' + result['id'], C.CYAN)}")
+    print(f"  New ID:  {result['id']}")
+
+
+def cmd_import(client, args):
+    """Import paste from URL."""
+    result = client.post("/api/pastes/import", {"url": args.url})
+    print(c("Paste imported!", C.GREEN))
+    print(f"  URL:    {c(client.server + '/' + result['id'], C.CYAN)}")
+    print(f"  ID:     {result['id']}")
+    print(f"  Lang:   {result.get('language', 'text')}")
+    if result.get("edit_token"):
+        print(f"  Token:  {c(result['edit_token'], C.YELLOW)}")
+
+
+def cmd_config(client, args):
+    """Configure server URL and API key."""
+    server = args.server or client.server
+    api_key = args.api_key or client.api_key
+    save_config(server, api_key)
+    print(c("Config saved!", C.GREEN))
+    print(f"  Server:  {server}")
+    print(f"  API key: {api_key[:8]}..." if len(api_key) > 8 else f"  API key: {api_key or '(none)'}")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="pb",
+        description="PasteBin CLI — manage pastes from the terminal",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  pb create script.py                    Upload a file
+  pb create -l python -t "My script"     Create from stdin
+  echo "hello" | pb create -             Pipe content
+  pb get abc123                          Print paste content
+  pb get abc123 --raw                    Raw content only
+  pb list                                List recent pastes
+  pb list --limit 50                     List 50 pastes
+  pb delete abc123                       Delete a paste
+  pb fork abc123                         Fork a paste
+  pb import https://example.com/file.py  Import from URL
+  pb config --server http://mypb.com     Configure server
+        """,
+    )
+
+    parser.add_argument("--server", help="Pastebin server URL")
+    parser.add_argument("--api-key", help="API key")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # create
+    p = sub.add_parser("create", help="Create a paste")
+    p.add_argument("file", help="File path or '-' for stdin")
+    p.add_argument("-l", "--language", default=None, help="Language (auto-detected from extension)")
+    p.add_argument("-t", "--title", default=None, help="Paste title")
+    p.add_argument("--burn", action="store_true", help="Burn after read")
+    p.add_argument("--expiry", choices=["never", "10min", "1hr", "1day", "1week"], default="never")
+    p.add_argument("--password", default=None, help="Encrypt with password")
+
+    # get
+    p = sub.add_parser("get", help="Get paste content")
+    p.add_argument("id", help="Paste ID")
+    p.add_argument("--raw", action="store_true", help="Print raw content only")
+    p.add_argument("--password", default=None, help="Decryption password")
+    p.add_argument("-q", "--quiet", action="store_true", help="Quiet mode (no headers)")
+
+    # list
+    p = sub.add_parser("list", help="List recent pastes")
+    p.add_argument("--limit", type=int, default=20, help="Number of pastes (default: 20)")
+
+    # delete
+    p = sub.add_parser("delete", help="Delete a paste")
+    p.add_argument("id", help="Paste ID")
+
+    # fork
+    p = sub.add_parser("fork", help="Fork a paste")
+    p.add_argument("id", help="Paste ID")
+
+    # import
+    p = sub.add_parser("import", help="Import paste from URL")
+    p.add_argument("url", help="URL to import")
+
+    # config
+    p = sub.add_parser("config", help="Configure server and API key")
+    p.add_argument("--server", default=None, help="Server URL")
+    p.add_argument("--api-key", default=None, help="API key")
+
+    args = parser.parse_args()
+    server, api_key = load_config()
+
+    if args.server:
+        server = args.server
+    if args.api_key:
+        api_key = args.api_key
+
+    client = Client(server, api_key)
+
+    commands = {
+        "create": cmd_create,
+        "get": cmd_get,
+        "list": cmd_list,
+        "delete": cmd_delete,
+        "fork": cmd_fork,
+        "import": cmd_import,
+        "config": cmd_config,
+    }
+
+    commands[args.command](client, args)
+
+
+if __name__ == "__main__":
+    main()
