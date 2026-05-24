@@ -80,11 +80,17 @@ export default function Navbar({ theme, onThemeChange, username, onLogout }: Pro
           <div className="relative ml-1">
             {username ? (
               <>
-                <button
-                  onClick={() => { setUserOpen(!userOpen); setThemeOpen(false); }}
+                <Link
+                  to={`/u/${username}`}
                   className="px-2.5 py-1.5 rounded-lg text-xs font-medium text-blue-400 hover:text-blue-300 hover:bg-white/5 transition-colors"
                 >
                   {username}
+                </Link>
+                <button
+                  onClick={() => { setUserOpen(!userOpen); setThemeOpen(false); }}
+                  className="text-slate-500 hover:text-slate-300 text-xs"
+                >
+                  ▾
                 </button>
                 {userOpen && (
                   <div className="absolute right-0 mt-1 bg-slate-800 border border-white/10 rounded-xl py-1 shadow-xl min-w-[120px]">

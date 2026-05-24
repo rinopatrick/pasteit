@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useEffect, useState, useRef } from "react";
+import { useParams, useNavigate, Link } from "react-router-dom";
 import SyntaxHighlight from "../components/SyntaxHighlight";
 import { LANG_COLORS } from "../components/PasteForm";
 import { useApiKey, fetchWithApiKey } from "../hooks/useApiKey";
@@ -16,6 +16,16 @@ interface Paste {
   is_encrypted: boolean;
   fork_count: number;
   forked_from: string | null;
+  user_id?: number;
+  username?: string;
+}
+
+interface Version {
+  id: number;
+  version_number: number;
+  title: string;
+  language: string;
+  created_at: string;
 }
 
 function timeAgo(dateStr: string) {
@@ -58,6 +68,28 @@ export default function ViewPaste({ theme }: Props) {
   // Fork
   const [forking, setForking] = useState(false);
 
+  // WebSocket
+  const [viewers, setViewers] = useState(0);
+  const wsRef = useRef<WebSocket | null>(null);
+
+  // Versioning
+  const [versions, setVersions] = useState<Version[]>([]);
+  const [showVersions, setShowVersions] = useState(false);
+  const [selectedVersion, setSelectedVersion] = useState<string | null>(null);
+
+  // QR / Embed
+  const [showQR, setShowQR] = useState(false);
+  const [qrSvg, setQrSvg] = useState("");
+  const [showEmbed, setShowEmbed] = useState(false);
+  const [embedCode, setEmbedCode] = useState("");
+
+  // Tags
+  const [tags, setTags] = useState<string[]>([]);
+
+  // Analytics
+  const [analytics, setAnalytics] = useState<{ views_by_day: { date: string; views: number }[]; referrers: { referrer: string; count: number }[] } | null>(null);
+  const [showAnalytics, setShowAnalytics] = useState(false);
+
   useEffect(() => {
     fetch(`/api/pastes/${id}`)
       .then(async (res) => {
@@ -70,6 +102,24 @@ export default function ViewPaste({ theme }: Props) {
       .then(setPaste)
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false));
+
+    // Fetch tags
+    fetch(`/api/pastes/${id}/tags`).then(r => r.ok ? r.json() : []).then(setTags).catch(() => {});
+
+    // WebSocket connection
+    const ws = new WebSocket(`ws://${window.location.host}/ws/paste/${id}`);
+    wsRef.current = ws;
+    ws.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      if (data.type === "users") setViewers(data.count);
+      if (data.type === "content_update" && data.user_id !== String(myId)) {
+        setEditContent(data.content);
+        if (paste) setPaste({ ...paste, content: data.content });
+      }
+    };
+    ws.onerror = () => {};
+    const myId = Math.random();
+    return () => { ws.close(); };
   }, [id]);
 
   const handleCopyContent = async () => {
@@ -151,6 +201,10 @@ export default function ViewPaste({ theme }: Props) {
       setEditing(false);
       setEditToken("");
       if (decryptedContent) setDecryptedContent(editContent);
+      // Broadcast update
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: "content_update", content: editContent }));
+      }
     } catch (err: any) {
       setEditError(err.message);
     } finally {
@@ -158,7 +212,51 @@ export default function ViewPaste({ theme }: Props) {
     }
   };
 
-  const displayContent = decryptedContent || paste?.content;
+  const loadVersions = async () => {
+    try {
+      const res = await fetch(`/api/pastes/${id}/versions`);
+      const data = await res.json();
+      setVersions(data);
+      setShowVersions(true);
+    } catch {}
+  };
+
+  const loadVersionContent = async (versionNum: number) => {
+    try {
+      const res = await fetch(`/api/pastes/${id}/versions/${versionNum}`);
+      const data = await res.json();
+      setSelectedVersion(data.content);
+    } catch {}
+  };
+
+  const handleQR = async () => {
+    try {
+      const res = await fetch(`/api/pastes/${id}/qr`);
+      const svg = await res.text();
+      setQrSvg(svg);
+      setShowQR(true);
+    } catch {}
+  };
+
+  const handleEmbed = async () => {
+    try {
+      const res = await fetch(`/api/pastes/${id}/embed?theme=${theme}`);
+      const data = await res.json();
+      setEmbedCode(data.embed_code);
+      setShowEmbed(true);
+    } catch {}
+  };
+
+  const loadAnalytics = async () => {
+    try {
+      const res = await fetch(`/api/pastes/${id}/analytics?days=30`);
+      const data = await res.json();
+      setAnalytics(data);
+      setShowAnalytics(true);
+    } catch {}
+  };
+
+  const displayContent = selectedVersion || decryptedContent || paste?.content;
 
   if (loading) {
     return (
@@ -181,9 +279,7 @@ export default function ViewPaste({ theme }: Props) {
             {error === "This paste has expired" ? "Paste Expired" : "Paste Not Found"}
           </h2>
           <p className="text-slate-400 mb-6">{error}</p>
-          <a href="/" className="text-blue-400 hover:text-blue-300 text-sm transition-colors">
-            Create a new paste
-          </a>
+          <a href="/" className="text-blue-400 hover:text-blue-300 text-sm transition-colors">Create a new paste</a>
         </div>
       </div>
     );
@@ -195,9 +291,6 @@ export default function ViewPaste({ theme }: Props) {
     <div className="max-w-4xl mx-auto px-4 py-8">
       {paste.burn_after_read && paste.view_count <= 1 && (
         <div className="mb-4 p-3 bg-red-500/10 border border-red-500/20 rounded-xl flex items-center gap-2 text-red-400 text-sm">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5 shrink-0">
-            <path fillRule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 5a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 5zm0 9a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
-          </svg>
           This paste was set to burn after read — it has been deleted.
         </div>
       )}
@@ -209,6 +302,88 @@ export default function ViewPaste({ theme }: Props) {
         </div>
       )}
 
+      {/* Modals */}
+      {showQR && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={() => setShowQR(false)}>
+          <div className="bg-slate-800 rounded-2xl p-6 max-w-sm" onClick={(e) => e.stopPropagation()}>
+            <h3 className="text-white font-bold mb-4">QR Code</h3>
+            <div className="bg-white rounded-xl p-4 flex justify-center" dangerouslySetInnerHTML={{ __html: qrSvg }} />
+            <button onClick={() => setShowQR(false)} className="mt-4 w-full py-2 bg-white/10 text-white rounded-lg text-sm">Close</button>
+          </div>
+        </div>
+      )}
+
+      {showEmbed && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={() => setShowEmbed(false)}>
+          <div className="bg-slate-800 rounded-2xl p-6 max-w-lg w-full mx-4" onClick={(e) => e.stopPropagation()}>
+            <h3 className="text-white font-bold mb-4">Embed Code</h3>
+            <textarea readOnly value={embedCode} className="w-full bg-white/5 border border-white/10 rounded-xl p-3 text-sm text-slate-300 font-mono h-24 resize-none" />
+            <button onClick={() => { navigator.clipboard.writeText(embedCode); setCopied(true); setTimeout(() => setCopied(false), 2000); }} className="mt-3 w-full py-2 bg-blue-500/20 text-blue-300 rounded-lg text-sm">{copied ? "Copied!" : "Copy Code"}</button>
+            <button onClick={() => setShowEmbed(false)} className="mt-2 w-full py-2 bg-white/10 text-white rounded-lg text-sm">Close</button>
+          </div>
+        </div>
+      )}
+
+      {showAnalytics && analytics && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={() => setShowAnalytics(false)}>
+          <div className="bg-slate-800 rounded-2xl p-6 max-w-lg w-full mx-4" onClick={(e) => e.stopPropagation()}>
+            <h3 className="text-white font-bold mb-4">Analytics (Last 30 Days)</h3>
+            <div className="flex items-end gap-1 h-32 mb-4">
+              {analytics.views_by_day.map((d, i) => {
+                const max = Math.max(...analytics.views_by_day.map(v => v.views), 1);
+                const h = (d.views / max) * 100;
+                return <div key={i} className="flex-1 bg-blue-500/60 rounded-t" style={{ height: `${h}%`, minHeight: d.views > 0 ? 4 : 1 }} title={`${d.date}: ${d.views} views`} />;
+              })}
+            </div>
+            <div className="flex justify-between text-xs text-slate-500 mb-4">
+              <span>{analytics.views_by_day[0]?.date}</span>
+              <span>{analytics.views_by_day[analytics.views_by_day.length - 1]?.date}</span>
+            </div>
+            {analytics.referrers.length > 0 && (
+              <div>
+                <p className="text-xs text-slate-500 uppercase mb-2">Top Referrers</p>
+                {analytics.referrers.map((r, i) => (
+                  <div key={i} className="flex justify-between text-sm text-slate-300 py-1 border-b border-white/5">
+                    <span className="truncate">{r.referrer}</span>
+                    <span className="text-slate-500">{r.count}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            <button onClick={() => setShowAnalytics(false)} className="mt-4 w-full py-2 bg-white/10 text-white rounded-lg text-sm">Close</button>
+          </div>
+        </div>
+      )}
+
+      {showVersions && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={() => { setShowVersions(false); setSelectedVersion(null); }}>
+          <div className="bg-slate-800 rounded-2xl p-6 max-w-lg w-full mx-4" onClick={(e) => e.stopPropagation()}>
+            <h3 className="text-white font-bold mb-4">Version History</h3>
+            {versions.length === 0 ? (
+              <p className="text-slate-400 text-sm">No previous versions.</p>
+            ) : (
+              <div className="space-y-2 max-h-64 overflow-y-auto">
+                {versions.map((v) => (
+                  <button key={v.id} onClick={() => loadVersionContent(v.version_number)} className="w-full text-left px-4 py-3 bg-white/5 rounded-xl hover:bg-white/10 transition-colors">
+                    <div className="flex justify-between">
+                      <span className="text-white text-sm font-medium">Version {v.version_number}</span>
+                      <span className="text-slate-500 text-xs">{timeAgo(v.created_at)}</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+            {selectedVersion && (
+              <div className="mt-4">
+                <p className="text-xs text-slate-500 mb-2">Preview:</p>
+                <pre className="bg-white/5 rounded-xl p-4 text-sm text-slate-300 font-mono max-h-48 overflow-y-auto whitespace-pre-wrap">{selectedVersion}</pre>
+              </div>
+            )}
+            <button onClick={() => { setShowVersions(false); setSelectedVersion(null); }} className="mt-4 w-full py-2 bg-white/10 text-white rounded-lg text-sm">Close</button>
+          </div>
+        </div>
+      )}
+
       <div className="bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl overflow-hidden">
         {/* Header */}
         <div className="px-5 py-4 border-b border-white/10 flex flex-wrap items-center gap-3 justify-between">
@@ -217,8 +392,12 @@ export default function ViewPaste({ theme }: Props) {
             <span className={`shrink-0 px-2 py-0.5 rounded-full text-xs font-medium ${langColor}`}>{paste.language}</span>
             {paste.burn_after_read && <span className="shrink-0 px-2 py-0.5 rounded-full text-xs font-medium bg-red-500/20 text-red-400">burned</span>}
             {paste.is_encrypted && <span className="shrink-0 px-2 py-0.5 rounded-full text-xs font-medium bg-amber-500/20 text-amber-400">encrypted</span>}
+            {viewers > 1 && <span className="shrink-0 px-2 py-0.5 rounded-full text-xs font-medium bg-green-500/20 text-green-400">{viewers} viewing</span>}
           </div>
           <div className="flex items-center gap-2 text-sm text-slate-400">
+            {paste.username && (
+              <Link to={`/u/${paste.username}`} className="text-blue-400 hover:text-blue-300 transition-colors">{paste.username}</Link>
+            )}
             <span>{timeAgo(paste.created_at)}</span>
             <span>&middot;</span>
             <span>{paste.view_count} view{paste.view_count !== 1 ? "s" : ""}</span>
@@ -231,6 +410,15 @@ export default function ViewPaste({ theme }: Props) {
           </div>
         </div>
 
+        {/* Tags */}
+        {tags.length > 0 && (
+          <div className="px-5 py-2 border-b border-white/10 flex flex-wrap gap-2">
+            {tags.map((tag) => (
+              <span key={tag} className="px-2 py-0.5 rounded-full text-xs font-medium bg-indigo-500/20 text-indigo-400 border border-indigo-500/20">#{tag}</span>
+            ))}
+          </div>
+        )}
+
         {/* Encrypted paste: show password prompt */}
         {paste.is_encrypted && !decryptedContent && (
           <div className="p-6 text-center">
@@ -242,17 +430,8 @@ export default function ViewPaste({ theme }: Props) {
             <h2 className="text-lg font-bold text-white mb-2">This paste is password-protected</h2>
             <p className="text-slate-400 text-sm mb-6">Enter the password to decrypt and view the content.</p>
             <div className="max-w-sm mx-auto flex gap-2">
-              <input
-                type="password"
-                value={decryptPassword}
-                onChange={(e) => setDecryptPassword(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && handleDecrypt()}
-                placeholder="Enter password"
-                className="flex-1 bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-slate-500 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/40"
-              />
-              <button onClick={handleDecrypt} disabled={decrypting} className="px-4 py-3 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 rounded-xl text-sm font-medium transition-colors disabled:opacity-50">
-                {decrypting ? "..." : "Unlock"}
-              </button>
+              <input type="password" value={decryptPassword} onChange={(e) => setDecryptPassword(e.target.value)} onKeyDown={(e) => e.key === "Enter" && handleDecrypt()} placeholder="Enter password" className="flex-1 bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-slate-500 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/40" />
+              <button onClick={handleDecrypt} disabled={decrypting} className="px-4 py-3 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 rounded-xl text-sm font-medium transition-colors disabled:opacity-50">{decrypting ? "..." : "Unlock"}</button>
             </div>
             {decryptError && <p className="text-red-400 text-sm mt-3">{decryptError}</p>}
           </div>
@@ -261,40 +440,14 @@ export default function ViewPaste({ theme }: Props) {
         {/* Edit mode */}
         {editing && (
           <div className="p-5 space-y-3 border-b border-white/10">
-            <div className="flex items-center gap-2 text-sm text-slate-400 mb-2">
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 text-amber-400">
-                <path fillRule="evenodd" d="M10 1a4.5 4.5 0 00-4.5 4.5V9H5a2 2 0 00-2 2v6a2 2 0 002 2h10a2 2 0 002-2v-6a2 2 0 00-2-2h-.5V5.5A4.5 4.5 0 0010 1zm3 8V5.5a3 3 0 10-6 0V9h6z" clipRule="evenodd" />
-              </svg>
-              <span>Enter edit token to save changes:</span>
-            </div>
-            <input
-              type="text"
-              value={editToken}
-              onChange={(e) => setEditToken(e.target.value)}
-              placeholder="Edit token"
-              className="w-full max-w-xs bg-white/5 border border-amber-500/30 rounded-lg px-3 py-2 text-white placeholder-slate-500 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/40"
-            />
-            <input
-              type="text"
-              value={editTitle}
-              onChange={(e) => setEditTitle(e.target.value)}
-              placeholder="Title"
-              className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white placeholder-slate-500 font-mono text-sm focus:outline-none"
-            />
-            <textarea
-              value={editContent}
-              onChange={(e) => setEditContent(e.target.value)}
-              className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-3 text-white placeholder-slate-500 font-mono text-sm min-h-[200px] resize-y focus:outline-none"
-              spellCheck={false}
-            />
+            <p className="text-sm text-slate-400">Enter edit token to save changes:</p>
+            <input type="text" value={editToken} onChange={(e) => setEditToken(e.target.value)} placeholder="Edit token" className="w-full max-w-xs bg-white/5 border border-amber-500/30 rounded-lg px-3 py-2 text-white placeholder-slate-500 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/40" />
+            <input type="text" value={editTitle} onChange={(e) => setEditTitle(e.target.value)} placeholder="Title" className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white placeholder-slate-500 font-mono text-sm focus:outline-none" />
+            <textarea value={editContent} onChange={(e) => setEditContent(e.target.value)} className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-3 text-white placeholder-slate-500 font-mono text-sm min-h-[200px] resize-y focus:outline-none" spellCheck={false} />
             {editError && <p className="text-red-400 text-sm">{editError}</p>}
             <div className="flex gap-2">
-              <button onClick={handleSaveEdit} disabled={saving || !editToken.trim()} className="px-4 py-2 bg-green-500/20 hover:bg-green-500/30 text-green-300 rounded-lg text-sm font-medium transition-colors disabled:opacity-50">
-                {saving ? "Saving..." : "Save"}
-              </button>
-              <button onClick={() => setEditing(false)} className="px-4 py-2 bg-white/5 hover:bg-white/10 text-slate-400 rounded-lg text-sm transition-colors">
-                Cancel
-              </button>
+              <button onClick={handleSaveEdit} disabled={saving || !editToken.trim()} className="px-4 py-2 bg-green-500/20 hover:bg-green-500/30 text-green-300 rounded-lg text-sm font-medium transition-colors disabled:opacity-50">{saving ? "Saving..." : "Save"}</button>
+              <button onClick={() => { setEditing(false); setSelectedVersion(null); }} className="px-4 py-2 bg-white/5 hover:bg-white/10 text-slate-400 rounded-lg text-sm transition-colors">Cancel</button>
             </div>
           </div>
         )}
@@ -302,21 +455,18 @@ export default function ViewPaste({ theme }: Props) {
         {/* Toolbar */}
         {!editing && (
           <div className="px-5 py-2 border-b border-white/10 flex items-center gap-2 flex-wrap">
-            <button onClick={() => setRaw(!raw)} className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-colors border ${raw ? "bg-white/10 border-white/20 text-white" : "bg-transparent border-transparent text-slate-400 hover:text-white"}`}>
-              Raw
-            </button>
-            <button onClick={handleCopyContent} className="px-2.5 py-1 rounded-lg text-xs font-medium text-slate-400 hover:text-white hover:bg-white/5 transition-colors">
-              {copied ? "Copied!" : "Copy"}
-            </button>
-            <button onClick={handleCopyUrl} className="px-2.5 py-1 rounded-lg text-xs font-medium text-slate-400 hover:text-white hover:bg-white/5 transition-colors">
-              Share URL
-            </button>
-            <button onClick={handleStartEdit} className="px-2.5 py-1 rounded-lg text-xs font-medium text-slate-400 hover:text-white hover:bg-white/5 transition-colors">
-              Edit
-            </button>
-            <button onClick={handleFork} disabled={forking} className="px-2.5 py-1 rounded-lg text-xs font-medium text-slate-400 hover:text-white hover:bg-white/5 transition-colors disabled:opacity-50">
-              {forking ? "Forking..." : "Fork"}
-            </button>
+            <button onClick={() => setRaw(!raw)} className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-colors border ${raw ? "bg-white/10 border-white/20 text-white" : "bg-transparent border-transparent text-slate-400 hover:text-white"}`}>Raw</button>
+            <button onClick={handleCopyContent} className="px-2.5 py-1 rounded-lg text-xs font-medium text-slate-400 hover:text-white hover:bg-white/5 transition-colors">{copied ? "Copied!" : "Copy"}</button>
+            <button onClick={handleCopyUrl} className="px-2.5 py-1 rounded-lg text-xs font-medium text-slate-400 hover:text-white hover:bg-white/5 transition-colors">Share URL</button>
+            <button onClick={handleStartEdit} className="px-2.5 py-1 rounded-lg text-xs font-medium text-slate-400 hover:text-white hover:bg-white/5 transition-colors">Edit</button>
+            <button onClick={handleFork} disabled={forking} className="px-2.5 py-1 rounded-lg text-xs font-medium text-slate-400 hover:text-white hover:bg-white/5 transition-colors disabled:opacity-50">{forking ? "Forking..." : "Fork"}</button>
+            <button onClick={handleQR} className="px-2.5 py-1 rounded-lg text-xs font-medium text-slate-400 hover:text-white hover:bg-white/5 transition-colors">QR Code</button>
+            <button onClick={handleEmbed} className="px-2.5 py-1 rounded-lg text-xs font-medium text-slate-400 hover:text-white hover:bg-white/5 transition-colors">Embed</button>
+            <button onClick={loadVersions} className="px-2.5 py-1 rounded-lg text-xs font-medium text-slate-400 hover:text-white hover:bg-white/5 transition-colors">History</button>
+            <button onClick={loadAnalytics} className="px-2.5 py-1 rounded-lg text-xs font-medium text-slate-400 hover:text-white hover:bg-white/5 transition-colors">Analytics</button>
+            {selectedVersion && (
+              <button onClick={() => setSelectedVersion(null)} className="px-2.5 py-1 rounded-lg text-xs font-medium bg-amber-500/20 text-amber-400 border border-amber-500/30">Viewing old version</button>
+            )}
           </div>
         )}
 

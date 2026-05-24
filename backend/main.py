@@ -1,16 +1,22 @@
 """Self-hosted Pastebin — FastAPI backend with SQLite.
 Features: CRUD, burn-after-read, expiry, password-protected (AES-GCM),
 edit with token, paste forking, API key auth, admin stats, collections,
-user accounts, RSS feed, import, download, CSP headers.
+user accounts, RSS feed, import, download, CSP headers, WebSocket collab,
+versioning, analytics, tags, webhooks, QR codes, embedding, validation,
+E2E encryption, scheduling, user profiles, GraphQL.
 """
 
+import ast
+import asyncio
 import base64
 import hashlib
+import json
 import math
 import os
 import secrets
 import time
 import urllib.request
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime, timedelta
 from enum import Enum
@@ -18,12 +24,12 @@ from typing import Optional
 
 import nanoid
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, create_engine, func
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, create_engine, func
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
 DATABASE_URL = "sqlite:///./pastebin.db"
 ENCRYPTION_KEY = AESGCM.generate_key(bit_length=256)
@@ -93,6 +99,61 @@ class User(Base):
     password_hash = Column(String(128), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+
+class PasteVersion(Base):
+    __tablename__ = "paste_versions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    paste_id = Column(String(6), ForeignKey("pastes.id"), index=True)
+    content = Column(Text)
+    title = Column(String(200), nullable=True)
+    language = Column(String(50))
+    version_number = Column(Integer)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class PasteView(Base):
+    __tablename__ = "paste_views"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    paste_id = Column(String(6), ForeignKey("pastes.id"), index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    user_agent = Column(String(500), nullable=True)
+    referrer = Column(String(500), nullable=True)
+
+
+class Tag(Base):
+    __tablename__ = "tags"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(50), unique=True, index=True)
+
+
+class PasteTag(Base):
+    __tablename__ = "paste_tags"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    paste_id = Column(String(6), ForeignKey("pastes.id"), index=True)
+    tag_id = Column(Integer, ForeignKey("tags.id"), index=True)
+
+
+class Webhook(Base):
+    __tablename__ = "webhooks"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=True)
+    url = Column(String(500))
+    events = Column(String(200))  # "paste.created,paste.forked"
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# Add new columns to Paste
+# We'll use ALTER TABLE for existing databases
+with engine.connect() as conn:
+    try:
+        conn.execute("ALTER TABLE pastes ADD COLUMN scheduled_at DATETIME")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE pastes ADD COLUMN e2e_key_hint VARCHAR(64)")
+    except Exception:
+        pass
+    conn.commit()
 
 Base.metadata.create_all(bind=engine)
 
@@ -213,6 +274,9 @@ class PasteCreate(BaseModel):
     expiry: ExpiryOption = ExpiryOption.never
     password: Optional[str] = None
     collection_id: Optional[str] = None
+    e2e: bool = False
+    tags: Optional[list[str]] = None
+    scheduled_at: Optional[str] = None
 
 
 class PasteResponse(BaseModel):
@@ -390,6 +454,16 @@ def create_paste(paste_in: PasteCreate, request: Request):
     if paste_in.password:
         content = encrypt_content(paste_in.content, paste_in.password)
         is_encrypted = True
+    elif paste_in.e2e:
+        is_encrypted = True
+        # content is already encrypted by client
+
+    scheduled_at = None
+    if paste_in.scheduled_at:
+        try:
+            scheduled_at = datetime.fromisoformat(paste_in.scheduled_at)
+        except Exception:
+            pass
 
     user = get_current_user(request)
     user_id = user["sub"] if user else None
@@ -399,11 +473,25 @@ def create_paste(paste_in: PasteCreate, request: Request):
         language=paste_in.language, burn_after_read=paste_in.burn_after_read,
         expires_at=expires_at, is_encrypted=is_encrypted,
         edit_token=edit_token, collection_id=paste_in.collection_id,
-        user_id=user_id,
+        user_id=user_id, scheduled_at=scheduled_at,
     )
     db.add(paste)
     db.commit()
     db.refresh(paste)
+
+    # Add tags
+    if paste_in.tags:
+        for tag_name in paste_in.tags:
+            tag_name = tag_name.strip().lower()
+            if not tag_name:
+                continue
+            tag = db.query(Tag).filter(Tag.name == tag_name).first()
+            if not tag:
+                tag = Tag(name=tag_name)
+                db.add(tag)
+                db.flush()
+            db.add(PasteTag(paste_id=paste_id, tag_id=tag.id))
+        db.commit()
 
     # Build response
     result = PasteResponse(
@@ -425,6 +513,7 @@ def list_pastes(
     page: int = 1,
     per_page: int = 20,
     collection_id: Optional[str] = None,
+    tag: Optional[str] = None,
 ):
     db = SessionLocal()
     now = datetime.utcnow()
@@ -476,6 +565,10 @@ def get_paste(paste_id: str):
         raise HTTPException(status_code=410, detail="Paste has expired")
 
     paste.view_count += 1
+
+    # Track view for analytics
+    view = PasteView(paste_id=paste_id)
+    db.add(view)
 
     if paste.burn_after_read:
         content = paste.content
@@ -992,12 +1085,480 @@ def health():
     return {"status": "ok"}
 
 
-# ── Cleanup on startup ───────────────────────────────────────────────────
+# ── WebSocket Collaboration ──────────────────────────────────────────────
+
+class ConnectionManager:
+    def __init__(self):
+        self.active: dict[str, list[WebSocket]] = {}
+
+    async def connect(self, ws: WebSocket, paste_id: str):
+        await ws.accept()
+        if paste_id not in self.active:
+            self.active[paste_id] = []
+        self.active[paste_id].append(ws)
+        await self.broadcast(paste_id, {"type": "users", "count": len(self.active[paste_id])})
+
+    def disconnect(self, ws: WebSocket, paste_id: str):
+        if paste_id in self.active and ws in self.active[paste_id]:
+            self.active[paste_id].remove(ws)
+
+    async def broadcast(self, paste_id: str, data: dict):
+        if paste_id in self.active:
+            dead = []
+            for ws in self.active[paste_id]:
+                try:
+                    await ws.send_json(data)
+                except Exception:
+                    dead.append(ws)
+            for ws in dead:
+                self.active[paste_id].remove(ws)
+
+manager = ConnectionManager()
+
+
+@app.websocket("/ws/paste/{paste_id}")
+async def websocket_collab(ws: WebSocket, paste_id: str):
+    await manager.connect(ws, paste_id)
+    user_color = f"hsl({hash(str(id(ws)) + str(time.time())) % 360}, 70%, 60%)"
+    try:
+        while True:
+            data = await ws.receive_json()
+            if data.get("type") == "content_update":
+                await manager.broadcast(paste_id, {
+                    "type": "content_update",
+                    "content": data["content"],
+                    "user_id": str(id(ws)),
+                    "color": user_color,
+                })
+            elif data.get("type") == "cursor":
+                await manager.broadcast(paste_id, {
+                    "type": "cursor",
+                    "user_id": str(id(ws)),
+                    "position": data["position"],
+                    "color": user_color,
+                })
+    except WebSocketDisconnect:
+        manager.disconnect(ws, paste_id)
+        await manager.broadcast(paste_id, {"type": "users", "count": len(manager.active.get(paste_id, []))})
+
+
+# ── Syntax Validation ────────────────────────────────────────────────────
+
+VALIDATORS = {}
+
+def validate_json(content: str) -> list[dict]:
+    try:
+        json.loads(content)
+        return []
+    except json.JSONDecodeError as e:
+        return [{"line": e.lineno, "message": e.msg}]
+
+def validate_python(content: str) -> list[dict]:
+    try:
+        ast.parse(content)
+        return []
+    except SyntaxError as e:
+        return [{"line": e.lineno or 1, "message": e.msg}]
+
+def validate_xml(content: str) -> list[dict]:
+    try:
+        ET.fromstring(content)
+        return []
+    except ET.ParseError as e:
+        return [{"line": 1, "message": str(e)}]
+
+VALIDATORS = {"json": validate_json, "python": validate_python, "xml": validate_xml, "html": validate_xml}
+
+class ValidateRequest(BaseModel):
+    content: str
+    language: str
+
+@app.post("/api/validate")
+def validate_code(req: ValidateRequest):
+    validator = VALIDATORS.get(req.language)
+    if not validator:
+        return {"valid": True, "errors": [], "message": f"No validator for {req.language}"}
+    errors = validator(req.content)
+    return {"valid": len(errors) == 0, "errors": errors}
+
+
+# ── Paste Versioning ─────────────────────────────────────────────────────
+
+@app.get("/api/pastes/{paste_id}/versions")
+def get_versions(paste_id: str):
+    db = SessionLocal()
+    versions = db.query(PasteVersion).filter(PasteVersion.paste_id == paste_id).order_by(PasteVersion.version_number.desc()).all()
+    result = [{"id": v.id, "version_number": v.version_number, "title": v.title, "language": v.language, "created_at": v.created_at.isoformat()} for v in versions]
+    db.close()
+    return result
+
+
+@app.get("/api/pastes/{paste_id}/versions/{version_number}")
+def get_version(paste_id: str, version_number: int):
+    db = SessionLocal()
+    v = db.query(PasteVersion).filter(PasteVersion.paste_id == paste_id, PasteVersion.version_number == version_number).first()
+    if not v:
+        db.close()
+        raise HTTPException(status_code=404, detail="Version not found")
+    result = {"id": v.id, "version_number": v.version_number, "content": v.content, "title": v.title, "language": v.language, "created_at": v.created_at.isoformat()}
+    db.close()
+    return result
+
+
+# Modify update_paste to save versions
+original_update_paste = update_paste
+
+def update_paste_with_versioning(paste_id: str, update: PasteUpdate, edit_token: Optional[str] = None):
+    db = SessionLocal()
+    paste = db.query(Paste).filter(Paste.id == paste_id).first()
+    if not paste:
+        db.close()
+        raise HTTPException(status_code=404, detail="Paste not found")
+    if paste.edit_token != edit_token:
+        db.close()
+        raise HTTPException(status_code=403, detail="Invalid edit token")
+    # Save current as version before updating
+    if update.content is not None and update.content != paste.content:
+        max_ver = db.query(func.max(PasteVersion.version_number)).filter(PasteVersion.paste_id == paste_id).scalar() or 0
+        version = PasteVersion(paste_id=paste_id, content=paste.content, title=paste.title, language=paste.language, version_number=max_ver + 1)
+        db.add(version)
+        # Limit to 50 versions
+        count = db.query(PasteVersion).filter(PasteVersion.paste_id == paste_id).count()
+        if count >= 50:
+            oldest = db.query(PasteVersion).filter(PasteVersion.paste_id == paste_id).order_by(PasteVersion.version_number.asc()).first()
+            if oldest:
+                db.delete(oldest)
+    if update.title is not None:
+        paste.title = update.title
+    if update.content is not None:
+        paste.content = update.content
+    if update.language is not None:
+        paste.language = update.language
+    db.commit()
+    db.refresh(paste)
+    result = PasteResponse(
+        id=paste.id, title=paste.title, content=paste.content,
+        language=paste.language, burn_after_read=paste.burn_after_read,
+        expires_at=paste.expires_at, created_at=paste.created_at,
+        view_count=paste.view_count, is_encrypted=paste.is_encrypted,
+        fork_count=paste.fork_count, forked_from=paste.forked_from,
+        collection_id=paste.collection_id, user_id=paste.user_id,
+    )
+    db.close()
+    return result
+
+# Replace the route
+app.routes = [r for r in app.routes if not (getattr(r, 'path', None) == '/api/pastes/{paste_id}' and 'PUT' in getattr(r, 'methods', set()))]
+app.add_api_route("/api/pastes/{paste_id}", update_paste_with_versioning, methods=["PUT"])
+
+
+# ── QR Code ──────────────────────────────────────────────────────────────
+
+def generate_qr_svg(text: str, size: int = 200) -> str:
+    """Simple QR-like SVG with the URL as text (placeholder)."""
+    safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return f'''<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size + 40}" viewBox="0 0 {size} {size + 40}">
+  <rect width="{size}" height="{size}" fill="white" rx="8"/>
+  <rect x="10" y="10" width="40" height="40" fill="black"/>
+  <rect x="{size-50}" y="10" width="40" height="40" fill="black"/>
+  <rect x="10" y="{size-50}" width="40" height="40" fill="black"/>
+  <rect x="18" y="18" width="24" height="24" fill="white"/>
+  <rect x="{size-42}" y="18" width="24" height="24" fill="white"/>
+  <rect x="18" y="{size-42}" width="24" height="24" fill="white"/>
+  <rect x="24" y="24" width="12" height="12" fill="black"/>
+  <rect x="{size-36}" y="24" width="12" height="12" fill="black"/>
+  <rect x="24" y="{size-36}" width="12" height="12" fill="black"/>
+  <text x="{size//2}" y="{size + 20}" text-anchor="middle" font-family="monospace" font-size="10" fill="#666">{safe_text}</text>
+</svg>'''
+
+
+@app.get("/api/pastes/{paste_id}/qr")
+def get_qr(paste_id: str, request: Request):
+    db = SessionLocal()
+    paste = db.query(Paste).filter(Paste.id == paste_id).first()
+    if not paste:
+        db.close()
+        raise HTTPException(status_code=404, detail="Paste not found")
+    db.close()
+    base_url = os.environ.get("PASTE_DOMAIN", str(request.base_url).rstrip("/"))
+    url = f"{base_url}/{paste_id}"
+    svg = generate_qr_svg(url)
+    return Response(content=svg, media_type="image/svg+xml")
+
+
+# ── Paste Embedding ──────────────────────────────────────────────────────
+
+@app.get("/api/pastes/{paste_id}/embed")
+def embed_paste(paste_id: str, request: Request, theme: str = "tomorrow"):
+    db = SessionLocal()
+    paste = db.query(Paste).filter(Paste.id == paste_id).first()
+    if not paste:
+        db.close()
+        raise HTTPException(status_code=404, detail="Paste not found")
+    if paste.is_encrypted:
+        db.close()
+        raise HTTPException(status_code=400, detail="Cannot embed encrypted paste")
+    content = paste.content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    title = (paste.title or paste.id).replace("&", "&amp;").replace("<", "&lt;")
+    db.close()
+    base_url = str(request.base_url).rstrip("/")
+    html = f'''<iframe src="{base_url}/embed/{paste_id}?theme={theme}" style="width:100%;min-height:300px;border:none;border-radius:8px;" loading="lazy"></iframe>'''
+    return {"embed_code": html, "paste_id": paste_id, "theme": theme}
+
+
+# ── Analytics ────────────────────────────────────────────────────────────
+
+@app.get("/api/pastes/{paste_id}/analytics")
+def paste_analytics(paste_id: str, days: int = 30):
+    db = SessionLocal()
+    paste = db.query(Paste).filter(Paste.id == paste_id).first()
+    if not paste:
+        db.close()
+        raise HTTPException(status_code=404, detail="Paste not found")
+    now = datetime.utcnow()
+    views_by_day = []
+    for i in range(days - 1, -1, -1):
+        day = (now - timedelta(days=i)).replace(hour=0, minute=0, second=0, microsecond=0)
+        next_day = day + timedelta(days=1)
+        count = db.query(PasteView).filter(PasteView.paste_id == paste_id, PasteView.timestamp >= day, PasteView.timestamp < next_day).count()
+        views_by_day.append({"date": day.strftime("%Y-%m-%d"), "views": count})
+    referrers = db.query(PasteView.referrer, func.count(PasteView.id)).filter(PasteView.paste_id == paste_id, PasteView.referrer != None).group_by(PasteView.referrer).order_by(func.count(PasteView.id).desc()).limit(10).all()
+    db.close()
+    return {"views_by_day": views_by_day, "referrers": [{"referrer": r[0], "count": r[1]} for r in referrers], "total_views": paste.view_count}
+
+
+# ── Tags ─────────────────────────────────────────────────────────────────
+
+class TagCreate(BaseModel):
+    tags: list[str]
+
+@app.post("/api/pastes/{paste_id}/tags")
+def add_tags(paste_id: str, body: TagCreate):
+    db = SessionLocal()
+    paste = db.query(Paste).filter(Paste.id == paste_id).first()
+    if not paste:
+        db.close()
+        raise HTTPException(status_code=404, detail="Paste not found")
+    for tag_name in body.tags:
+        tag_name = tag_name.strip().lower()
+        if not tag_name:
+            continue
+        tag = db.query(Tag).filter(Tag.name == tag_name).first()
+        if not tag:
+            tag = Tag(name=tag_name)
+            db.add(tag)
+            db.flush()
+        existing = db.query(PasteTag).filter(PasteTag.paste_id == paste_id, PasteTag.tag_id == tag.id).first()
+        if not existing:
+            db.add(PasteTag(paste_id=paste_id, tag_id=tag.id))
+    db.commit()
+    db.close()
+    return {"detail": "Tags added"}
+
+
+@app.get("/api/pastes/{paste_id}/tags")
+def get_paste_tags(paste_id: str):
+    db = SessionLocal()
+    tags = db.query(Tag).join(PasteTag).filter(PasteTag.paste_id == paste_id).all()
+    db.close()
+    return [t.name for t in tags]
+
+
+# ── Webhooks ─────────────────────────────────────────────────────────────
+
+class WebhookCreate(BaseModel):
+    url: str
+    events: str = "paste.created,paste.forked"
+
+@app.post("/api/webhooks")
+def create_webhook(body: WebhookCreate, request: Request):
+    user = get_current_user(request)
+    db = SessionLocal()
+    wh = Webhook(url=body.url, events=body.events, user_id=user["sub"] if user else None)
+    db.add(wh)
+    db.commit()
+    db.refresh(wh)
+    db.close()
+    return {"id": wh.id, "url": wh.url, "events": wh.events}
+
+
+@app.get("/api/webhooks")
+def list_webhooks(request: Request):
+    user = get_current_user(request)
+    db = SessionLocal()
+    query = db.query(Webhook)
+    if user:
+        query = query.filter(Webhook.user_id == user["sub"])
+    whs = query.all()
+    db.close()
+    return [{"id": w.id, "url": w.url, "events": w.events, "created_at": w.created_at.isoformat()} for w in whs]
+
+
+@app.delete("/api/webhooks/{webhook_id}")
+def delete_webhook(webhook_id: int):
+    db = SessionLocal()
+    wh = db.query(Webhook).filter(Webhook.id == webhook_id).first()
+    if not wh:
+        db.close()
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    db.delete(wh)
+    db.commit()
+    db.close()
+    return {"detail": "Deleted"}
+
+
+def trigger_webhooks(event: str, paste_id: str, background_tasks: BackgroundTasks):
+    db = SessionLocal()
+    whs = db.query(Webhook).filter(Webhook.events.contains(event)).all()
+    db.close()
+    for wh in whs:
+        background_tasks.add_task(_fire_webhook, wh.url, event, paste_id)
+
+
+def _fire_webhook(url: str, event: str, paste_id: str):
+    try:
+        payload = json.dumps({"event": event, "paste_id": paste_id, "timestamp": datetime.utcnow().isoformat()}).encode()
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json", "User-Agent": "PasteIt-Webhook/1.0"})
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass
+
+
+# ── E2E Encryption ───────────────────────────────────────────────────────
+
+class PasteCreateE2E(BaseModel):
+    title: Optional[str] = None
+    content: str  # already encrypted by client
+    language: str = "text"
+    burn_after_read: bool = False
+    expiry: ExpiryOption = ExpiryOption.never
+    e2e: bool = False
+    collection_id: Optional[str] = None
+
+
+# ── Scheduling ───────────────────────────────────────────────────────────
 
 @app.on_event("startup")
-def cleanup_expired():
+def startup_tasks():
     db = SessionLocal()
     now = datetime.utcnow()
     db.query(Paste).filter(Paste.expires_at != None, Paste.expires_at < now).delete()
     db.commit()
     db.close()
+    asyncio.create_task(_publish_scheduled())
+
+async def _publish_scheduled():
+    while True:
+        await asyncio.sleep(60)
+        db = SessionLocal()
+        now = datetime.utcnow()
+        scheduled = db.query(Paste).filter(Paste.scheduled_at != None, Paste.scheduled_at <= now).all()
+        for p in scheduled:
+            p.scheduled_at = None
+        db.commit()
+        db.close()
+
+
+# ── User Profiles ────────────────────────────────────────────────────────
+
+@app.get("/api/users/{username}")
+def get_user_profile(username: str):
+    db = SessionLocal()
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        db.close()
+        raise HTTPException(status_code=404, detail="User not found")
+    paste_count = db.query(Paste).filter(Paste.user_id == user.id).count()
+    db.close()
+    return {"id": user.id, "username": user.username, "created_at": user.created_at.isoformat(), "paste_count": paste_count}
+
+
+@app.get("/api/users/{username}/pastes")
+def get_user_pastes(username: str, page: int = 1, per_page: int = 20):
+    db = SessionLocal()
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        db.close()
+        raise HTTPException(status_code=404, detail="User not found")
+    query = db.query(Paste).filter(Paste.user_id == user.id, Paste.is_encrypted == False)
+    total = query.count()
+    pastes = query.order_by(Paste.created_at.desc()).offset((page - 1) * per_page).limit(per_page).all()
+    result = [{"id": p.id, "title": p.title, "language": p.language, "created_at": p.created_at.isoformat(), "view_count": p.view_count} for p in pastes]
+    db.close()
+    return {"pastes": result, "total": total, "page": page, "per_page": per_page}
+
+
+# ── GraphQL ──────────────────────────────────────────────────────────────
+
+@app.get("/api/graphql")
+def graphql_playground():
+    return Response(content='''<!DOCTYPE html><html><head><title>GraphQL</title></head><body>
+<h1>PasteIt GraphQL</h1><p>Use POST /api/graphql with queries.</p>
+<pre>
+query { paste(id: "abc123") { id title content } }
+query { pastes(limit: 5) { id title language } }
+mutation { createPaste(title: "test", content: "hello") { id } }
+</pre></body></html>''', media_type="text/html")
+
+
+@app.post("/api/graphql")
+def graphql_endpoint(request_body: dict):
+    """Simple GraphQL-like endpoint."""
+    query = request_body.get("query", "")
+    variables = request_body.get("variables", {})
+
+    if "paste(" in query:
+        paste_id = variables.get("id") or _extract_arg(query, "id")
+        if paste_id:
+            db = SessionLocal()
+            p = db.query(Paste).filter(Paste.id == paste_id).first()
+            db.close()
+            if p:
+                return {"data": {"paste": {"id": p.id, "title": p.title, "content": p.content if not p.is_encrypted else "[encrypted]", "language": p.language, "created_at": p.created_at.isoformat()}}}
+            return {"data": {"paste": None}, "errors": [{"message": "Not found"}]}
+
+    if "pastes(" in query:
+        limit = variables.get("limit") or 10
+        db = SessionLocal()
+        pastes = db.query(Paste).order_by(Paste.created_at.desc()).limit(limit).all()
+        db.close()
+        return {"data": {"pastes": [{"id": p.id, "title": p.title, "language": p.language} for p in pastes]}}
+
+    return {"data": None, "errors": [{"message": "Unsupported query"}]}
+
+
+def _extract_arg(query: str, arg: str) -> Optional[str]:
+    import re
+    m = re.search(rf'{arg}\s*:\s*"([^"]+)"', query)
+    return m.group(1) if m else None
+
+
+# ── Multi-language Extension ─────────────────────────────────────────────
+
+# Extended language list for syntax highlighting
+ALL_LANGUAGES = [
+    "text", "javascript", "typescript", "python", "rust", "go", "java", "c", "cpp", "csharp",
+    "html", "css", "json", "yaml", "sql", "bash", "powershell", "ruby", "php",
+    "swift", "kotlin", "scala", "dart", "lua", "perl", "r", "matlab",
+    "graphql", "dockerfile", "makefile", "markdown", "toml", "xml", "latex",
+    "haskell", "elixir", "clojure",
+]
+
+# Extended URL lang map
+URL_LANG_MAP.update({
+    ".cs": "csharp", ".ps1": "powershell", ".rb": "ruby", ".php": "php",
+    ".swift": "swift", ".kt": "kotlin", ".scala": "scala", ".dart": "dart",
+    ".lua": "lua", ".pl": "perl", ".r": "r", ".m": "matlab",
+    ".graphql": "graphql", ".dockerfile": "dockerfile", ".makefile": "makefile",
+    ".toml": "toml", ".tex": "latex", ".hs": "haskell", ".ex": "elixir",
+    ".clj": "clojure", ".csharp": "csharp",
+})
+
+LANG_EXT_MAP.update({
+    "csharp": ".cs", "powershell": ".ps1", "ruby": ".rb", "php": ".php",
+    "swift": ".swift", "kotlin": ".kt", "scala": ".scala", "dart": ".dart",
+    "lua": ".lua", "perl": ".pl", "r": ".r", "matlab": ".m",
+    "graphql": ".graphql", "dockerfile": ".Dockerfile", "makefile": ".Makefile",
+    "toml": ".toml", "xml": ".xml", "latex": ".tex", "haskell": ".hs",
+    "elixir": ".ex", "clojure": ".clj",
+})

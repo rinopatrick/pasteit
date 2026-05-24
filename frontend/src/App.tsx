@@ -9,6 +9,7 @@ import AdminDashboard from "./pages/AdminDashboard";
 import CollectionsPage from "./pages/CollectionsPage";
 import CollectionDetail from "./pages/CollectionDetail";
 import AuthPage from "./pages/AuthPage";
+import UserProfile from "./pages/UserProfile";
 
 export default function App() {
   const [theme, setTheme] = useState(() => localStorage.getItem("pb-theme") || "tomorrow");
@@ -49,6 +50,7 @@ export default function App() {
         <Route path="/collections" element={<CollectionsPage />} />
         <Route path="/collections/:id" element={<CollectionDetail theme={theme} />} />
         <Route path="/auth" element={<AuthPage onLogin={handleLogin} />} />
+        <Route path="/u/:username" element={<UserProfile />} />
         <Route path="/:id" element={<ViewPaste theme={theme} />} />
       </Routes>
     </div>

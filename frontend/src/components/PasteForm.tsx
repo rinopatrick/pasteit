@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
+import { TEMPLATES } from "../templates";
 
 export interface PasteFormData {
   title: string;
@@ -9,11 +10,16 @@ export interface PasteFormData {
   burn_after_read: boolean;
   expiry: string;
   password?: string;
+  tags?: string[];
+  e2e?: boolean;
 }
 
 const LANGUAGES = [
-  "text", "javascript", "typescript", "python", "rust", "go", "java", "c", "cpp",
-  "html", "css", "json", "yaml", "sql", "bash", "markdown",
+  "text", "javascript", "typescript", "python", "rust", "go", "java", "c", "cpp", "csharp",
+  "html", "css", "json", "yaml", "sql", "bash", "powershell", "ruby", "php",
+  "swift", "kotlin", "scala", "dart", "lua", "perl", "r", "matlab",
+  "graphql", "dockerfile", "makefile", "markdown", "toml", "xml", "latex",
+  "haskell", "elixir", "clojure",
 ];
 
 const EXPIRY_OPTIONS = [
@@ -34,13 +40,34 @@ export const LANG_COLORS: Record<string, string> = {
   java: "bg-red-500/20 text-red-400",
   c: "bg-gray-500/20 text-gray-400",
   cpp: "bg-pink-500/20 text-pink-400",
+  csharp: "bg-purple-500/20 text-purple-400",
   html: "bg-orange-500/20 text-orange-400",
   css: "bg-blue-500/20 text-blue-400",
   json: "bg-amber-500/20 text-amber-400",
   yaml: "bg-teal-500/20 text-teal-400",
   sql: "bg-violet-500/20 text-violet-400",
   bash: "bg-green-500/20 text-green-400",
+  powershell: "bg-blue-500/20 text-blue-400",
+  ruby: "bg-red-500/20 text-red-400",
+  php: "bg-indigo-500/20 text-indigo-400",
+  swift: "bg-orange-500/20 text-orange-400",
+  kotlin: "bg-purple-500/20 text-purple-400",
+  scala: "bg-red-500/20 text-red-400",
+  dart: "bg-cyan-500/20 text-cyan-400",
+  lua: "bg-blue-500/20 text-blue-400",
+  perl: "bg-indigo-500/20 text-indigo-400",
+  r: "bg-blue-500/20 text-blue-400",
+  matlab: "bg-orange-500/20 text-orange-400",
+  graphql: "bg-pink-500/20 text-pink-400",
+  dockerfile: "bg-blue-500/20 text-blue-400",
+  makefile: "bg-gray-500/20 text-gray-400",
   markdown: "bg-slate-500/20 text-slate-400",
+  toml: "bg-gray-500/20 text-gray-400",
+  xml: "bg-orange-500/20 text-orange-400",
+  latex: "bg-green-500/20 text-green-400",
+  haskell: "bg-purple-500/20 text-purple-400",
+  elixir: "bg-purple-500/20 text-purple-400",
+  clojure: "bg-green-500/20 text-green-400",
 };
 
 interface Props {
@@ -57,10 +84,15 @@ export default function PasteForm({ onSubmit, loading }: Props) {
   const [protectWithPassword, setProtectWithPassword] = useState(false);
   const [pastePassword, setPastePassword] = useState("");
   const [previewMode, setPreviewMode] = useState(false);
+  const [tags, setTags] = useState("");
+  const [showTemplates, setShowTemplates] = useState(false);
+  const [validationResult, setValidationResult] = useState<{ valid: boolean; errors: { line: number; message: string }[] } | null>(null);
+  const [validating, setValidating] = useState(false);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!content.trim()) return;
+    const tagList = tags.split(",").map((t) => t.trim()).filter(Boolean);
     onSubmit({
       title,
       content,
@@ -68,7 +100,33 @@ export default function PasteForm({ onSubmit, loading }: Props) {
       burn_after_read: burnAfterRead,
       expiry,
       password: protectWithPassword ? pastePassword : undefined,
+      tags: tagList.length > 0 ? tagList : undefined,
     });
+  };
+
+  const handleValidate = async () => {
+    if (!content.trim()) return;
+    setValidating(true);
+    try {
+      const res = await fetch("/api/validate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content, language }),
+      });
+      const data = await res.json();
+      setValidationResult(data);
+    } catch {
+      setValidationResult(null);
+    } finally {
+      setValidating(false);
+    }
+  };
+
+  const applyTemplate = (template: typeof TEMPLATES[0]) => {
+    setContent(template.content);
+    setLanguage(template.language);
+    setShowTemplates(false);
+    setValidationResult(null);
   };
 
   const renderMarkdownPreview = () => {
@@ -91,6 +149,38 @@ export default function PasteForm({ onSubmit, loading }: Props) {
         onChange={(e) => setTitle(e.target.value)}
         className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-slate-500 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all"
       />
+
+      {/* Templates dropdown */}
+      <div className="relative">
+        <button
+          type="button"
+          onClick={() => setShowTemplates(!showTemplates)}
+          className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium bg-white/5 border border-white/10 text-slate-400 hover:text-white hover:bg-white/10 transition-all"
+        >
+          <span>Templates</span>
+          <svg className={`w-4 h-4 transition-transform ${showTemplates ? "rotate-180" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+          </svg>
+        </button>
+        {showTemplates && (
+          <div className="absolute z-10 mt-2 w-full bg-slate-800 border border-white/10 rounded-xl shadow-xl max-h-64 overflow-y-auto">
+            {TEMPLATES.map((t, i) => (
+              <button
+                key={i}
+                type="button"
+                onClick={() => applyTemplate(t)}
+                className="w-full text-left px-4 py-3 hover:bg-white/10 transition-colors flex items-center gap-3 border-b border-white/5 last:border-0"
+              >
+                <span className="w-8 h-8 rounded-lg bg-white/10 flex items-center justify-center text-xs font-mono text-slate-300 shrink-0">{t.icon}</span>
+                <div>
+                  <p className="text-sm text-white font-medium">{t.name}</p>
+                  <p className="text-xs text-slate-500">{t.language}</p>
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
 
       {/* Edit/Preview tabs for markdown */}
       {language === "markdown" && (
@@ -119,20 +209,45 @@ export default function PasteForm({ onSubmit, loading }: Props) {
       {previewMode && language === "markdown" ? (
         renderMarkdownPreview()
       ) : (
-        <textarea
-          placeholder="Paste your code here..."
-          value={content}
-          onChange={(e) => setContent(e.target.value)}
-          className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-4 text-white placeholder-slate-500 font-mono text-sm min-h-[300px] resize-y focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all leading-relaxed"
-          spellCheck={false}
-        />
+        <div className="relative">
+          <textarea
+            placeholder="Paste your code here..."
+            value={content}
+            onChange={(e) => { setContent(e.target.value); setValidationResult(null); }}
+            className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-4 text-white placeholder-slate-500 font-mono text-sm min-h-[300px] resize-y focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500/40 transition-all leading-relaxed"
+            spellCheck={false}
+          />
+          {/* Validation errors */}
+          {validationResult && !validationResult.valid && (
+            <div className="mt-2 p-3 bg-red-500/10 border border-red-500/20 rounded-xl">
+              <p className="text-red-400 text-xs font-semibold mb-2">Validation Errors:</p>
+              {validationResult.errors.map((err, i) => (
+                <p key={i} className="text-red-300 text-xs">Line {err.line}: {err.message}</p>
+              ))}
+            </div>
+          )}
+          {validationResult && validationResult.valid && (
+            <div className="mt-2 p-3 bg-green-500/10 border border-green-500/20 rounded-xl">
+              <p className="text-green-400 text-xs font-semibold">Syntax is valid!</p>
+            </div>
+          )}
+        </div>
       )}
+
+      {/* Tags input */}
+      <input
+        type="text"
+        placeholder="Tags (comma-separated, e.g. python, api, web)"
+        value={tags}
+        onChange={(e) => setTags(e.target.value)}
+        className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-slate-500 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/40 transition-all"
+      />
 
       <div className="flex flex-wrap items-center gap-3">
         <select
           value={language}
-          onChange={(e) => { setLanguage(e.target.value); setPreviewMode(false); }}
-          className="bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/40 appearance-none cursor-pointer"
+          onChange={(e) => { setLanguage(e.target.value); setPreviewMode(false); setValidationResult(null); }}
+          className="bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/40 appearance-none cursor-pointer max-w-[200px]"
         >
           {LANGUAGES.map((lang) => (
             <option key={lang} value={lang} className="bg-slate-800 text-slate-200">{lang}</option>
@@ -156,9 +271,6 @@ export default function PasteForm({ onSubmit, loading }: Props) {
             burnAfterRead ? "bg-red-500/20 border-red-500/30 text-red-400" : "bg-white/5 border-white/10 text-slate-400 hover:text-white hover:bg-white/10"
           }`}
         >
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
-            <path fillRule="evenodd" d="M12.395 2.553a1 1 0 00-1.45-.385c-.345.23-.614.558-.822.88-.214.33-.403.713-.57 1.116-.334.804-.614 1.768-.84 2.734a31.365 31.365 0 00-.613 3.58 2.64 2.64 0 01-.945-1.067c-.328-.68-.398-1.534-.398-2.654A1 1 0 005.05 6.05 6.981 6.981 0 003 11a7 7 0 1011.95-4.95c-.592-.591-.98-.985-1.348-1.467-.363-.476-.724-1.063-1.207-2.03zM12.12 15.12A3 3 0 017 13s.879.5 2.5.5c0-1 .5-4 1.25-4.5.5 1 .786 1.293 1.371 1.879A2.99 2.99 0 0113 13a2.99 2.99 0 01-.879 2.121z" clipRule="evenodd" />
-          </svg>
           Burn after read
         </button>
 
@@ -169,10 +281,16 @@ export default function PasteForm({ onSubmit, loading }: Props) {
             protectWithPassword ? "bg-amber-500/20 border-amber-500/30 text-amber-400" : "bg-white/5 border-white/10 text-slate-400 hover:text-white hover:bg-white/10"
           }`}
         >
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
-            <path fillRule="evenodd" d="M10 1a4.5 4.5 0 00-4.5 4.5V9H5a2 2 0 00-2 2v6a2 2 0 002 2h10a2 2 0 002-2v-6a2 2 0 00-2-2h-.5V5.5A4.5 4.5 0 0010 1zm3 8V5.5a3 3 0 10-6 0V9h6z" clipRule="evenodd" />
-          </svg>
           Encrypt
+        </button>
+
+        <button
+          type="button"
+          onClick={handleValidate}
+          disabled={!content.trim() || validating}
+          className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all border bg-white/5 border-white/10 text-slate-400 hover:text-white hover:bg-white/10 disabled:opacity-50"
+        >
+          {validating ? "Checking..." : "Validate"}
         </button>
       </div>
 

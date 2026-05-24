@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 320px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      padding: 16px;
+    }
+    h1 { font-size: 16px; margin-bottom: 12px; color: #f8fafc; }
+    label { font-size: 12px; color: #94a3b8; display: block; margin-bottom: 4px; }
+    input, textarea, select {
+      width: 100%;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 8px;
+      padding: 8px 12px;
+      color: #e2e8f0;
+      font-size: 13px;
+      margin-bottom: 12px;
+      outline: none;
+    }
+    textarea { min-height: 100px; resize: vertical; font-family: monospace; }
+    input:focus, textarea:focus { border-color: #3b82f6; }
+    button {
+      width: 100%;
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      border: none;
+      border-radius: 8px;
+      padding: 10px;
+      color: white;
+      font-weight: 600;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    button:hover { opacity: 0.9; }
+    .result { margin-top: 12px; padding: 8px; background: rgba(16,185,129,0.1); border-radius: 8px; display: none; }
+    .result a { color: #34d399; text-decoration: none; font-size: 13px; }
+    .error { background: rgba(239,68,68,0.1); color: #f87171; }
+    .settings { margin-top: 12px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.1); }
+  </style>
+</head>
+<body>
+  <h1>📋 PasteIt</h1>
+  <label>Content</label>
+  <textarea id="content" placeholder="Paste your code here..."></textarea>
+  <label>Language</label>
+  <select id="language">
+    <option value="text">Text</option>
+    <option value="javascript">JavaScript</option>
+    <option value="typescript">TypeScript</option>
+    <option value="python">Python</option>
+    <option value="rust">Rust</option>
+    <option value="go">Go</option>
+    <option value="java">Java</option>
+    <option value="html">HTML</option>
+    <option value="css">CSS</option>
+    <option value="json">JSON</option>
+    <option value="yaml">YAML</option>
+    <option value="sql">SQL</option>
+    <option value="bash">Bash</option>
+  </select>
+  <button id="paste">Create Paste</button>
+  <div class="result" id="result">
+    <a id="link" href="#" target="_blank"></a>
+  </div>
+
+  <div class="settings">
+    <label>Server URL</label>
+    <input id="serverUrl" placeholder="http://localhost:5174" />
+    <label>API Key (optional)</label>
+    <input id="apiKey" type="password" placeholder="Your API key" />
+    <button id="saveConfig" style="background: rgba(255,255,255,0.1); font-size: 12px; padding: 6px;">Save Config</button>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
