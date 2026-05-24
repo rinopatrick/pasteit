@@ -1247,9 +1247,8 @@ def update_paste_with_versioning(paste_id: str, update: PasteUpdate, edit_token:
     db.close()
     return result
 
-# Replace the route
-app.routes = [r for r in app.routes if not (getattr(r, 'path', None) == '/api/pastes/{paste_id}' and 'PUT' in getattr(r, 'methods', set()))]
-app.add_api_route("/api/pastes/{paste_id}", update_paste_with_versioning, methods=["PUT"])
+# Note: versioning is handled by the update_paste function above
+# The update_paste_with_versioning function is available as reference
 
 
 # ── QR Code ──────────────────────────────────────────────────────────────
