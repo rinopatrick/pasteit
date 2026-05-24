@@ -10,6 +10,9 @@ import CollectionsPage from "./pages/CollectionsPage";
 import CollectionDetail from "./pages/CollectionDetail";
 import AuthPage from "./pages/AuthPage";
 import UserProfile from "./pages/UserProfile";
+import BooksPage from "./pages/BooksPage";
+import BookDetailPage from "./pages/BookDetailPage";
+import MarketplacePage from "./pages/MarketplacePage";
 
 export default function App() {
   const [theme, setTheme] = useState(() => localStorage.getItem("pb-theme") || "tomorrow");
@@ -45,6 +48,9 @@ export default function App() {
       <Routes>
         <Route path="/" element={<Home />} />
         <Route path="/recent" element={<RecentPastes />} />
+        <Route path="/books" element={<BooksPage />} />
+        <Route path="/books/:id" element={<BookDetailPage />} />
+        <Route path="/marketplace" element={<MarketplacePage />} />
         <Route path="/compare" element={<DiffView />} />
         <Route path="/admin" element={<AdminDashboard />} />
         <Route path="/collections" element={<CollectionsPage />} />

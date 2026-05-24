@@ -19,7 +19,9 @@ export default function Navbar({ theme, onThemeChange, username, onLogout }: Pro
     { to: "/", label: "New Paste" },
     { to: "/recent", label: "Recent" },
     { to: "/collections", label: "Collections" },
+    { to: "/books", label: "Books" },
     { to: "/compare", label: "Compare" },
+    { to: "/marketplace", label: "Market" },
     { to: "/admin", label: "Admin" },
   ];
 

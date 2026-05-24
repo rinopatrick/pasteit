@@ -3,6 +3,9 @@ import { useParams, useNavigate, Link } from "react-router-dom";
 import SyntaxHighlight from "../components/SyntaxHighlight";
 import { LANG_COLORS } from "../components/PasteForm";
 import { useApiKey, fetchWithApiKey } from "../hooks/useApiKey";
+import CodeRunner from "../components/CodeRunner";
+import CodeReviewPanel from "../components/CodeReviewPanel";
+import CommentSection from "../components/CommentSection";
 
 interface Paste {
   id: string;
