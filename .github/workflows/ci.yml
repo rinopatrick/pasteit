@@ -1,14 +1,24 @@
 name: CI
+
 on:
   push:
     branches: ["main", "master"]
   pull_request:
+
 jobs:
   checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Repo health
+      - name: Repository integrity checks
         run: |
+          set -euo pipefail
           test -f LICENSE
-          echo "Basic checks passed"
+          test -f README.md
+          # Ensure no accidental local runtime DB artifacts are committed
+          if find . -maxdepth 2 -type f \( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) | grep -q .; then
+            echo "Found database artifacts committed to repo"
+            find . -maxdepth 2 -type f \( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \)
+            exit 1
+          fi
+          echo "Integrity checks passed"
