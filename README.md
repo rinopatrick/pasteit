@@ -1,3 +1,5 @@
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+
 # pasteit
 
 Self-hosted pastebin with syntax highlighting, encryption, and a CLI tool.
@@ -89,3 +91,13 @@ pb fork abc123                         # fork a paste
 ## License
 
 MIT
+
+## Production-readiness status
+
+Current state: **engineering sample / pre-production**.
+
+Recommended next steps:
+1. Add CI checks (tests + lint) on every push/PR
+2. Add release/versioning policy
+3. Add deployment/runtime hardening docs
+4. Add monitoring and operational runbook
